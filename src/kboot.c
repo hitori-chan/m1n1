@@ -2047,6 +2047,19 @@ static int dt_set_display(void)
             return ret;
     } else if (!fdt_node_check_compatible(dt, 0, "apple,t6022")) {
         /* noop */
+    } else if (!fdt_node_check_compatible(dt, 0, "apple,t6030") ||
+               !fdt_node_check_compatible(dt, 0, "apple,t6031") ||
+               !fdt_node_check_compatible(dt, 0, "apple,t6034")) {
+        /* M3 Pro/Max: the M2 Pro/Max carveouts, internal panel only. A
+         * missing carveout leaves the DCP disabled and the boot framebuffer
+         * in place instead of failing the boot. */
+        ret = dt_carveout_reserved_regions("dcp", "disp0", disp0_piodma_alias,
+                                           disp_reserved_regions_t602x,
+                                           ARRAY_SIZE(disp_reserved_regions_t602x));
+        if (ret) {
+            printf("FDT: M3 display reserved-memory setup failed, DCP stays disabled\n");
+            return 0;
+        }
     } else {
         printf("FDT: unknown compatible, skip display reserved-memory setup\n");
         return 0;
