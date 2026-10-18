@@ -66,7 +66,7 @@ def sptm_mode_arg(val):
     raise ValueError()
 args.sptm_mode = sptm_mode_arg(args.sptm_mode)
 
-u = ProxyUtils(p, heap_size = 128 * 1024 * 1024,
+u = ProxyUtils(p, heap_size = int(__import__('os').environ.get('G15_GUEST_HEAP_MB', '128')) * 1024 * 1024,
                m1n1_heap = 128 * 1024 * 1024)
 
 # Setup counter redirect / AHCR_EL2 as expected by macOS for macho payloads
