@@ -27,7 +27,11 @@ class PMU:
 
     def reset_panic_counter(self):
         if self.primary and self.bus_type == "spmi":
-            leg_scrpad = self.node.info_leg__scrpad[0]
+            scrpad = self.node.info_leg__scrpad
+            if isinstance(scrpad, int):
+                leg_scrpad = scrpad  # M3: scalar (m1n1#449)
+            else:
+                leg_scrpad = scrpad[0]
             self.spmi.write8(self.reg, leg_scrpad + 2, 0) # error counts
         elif self.primary and self.bus_type == "i2c":
             if self.node.compatible[0] in ["pmu,d2255", "pmu,d2257", "pmu,d2333", "pmu,d2365", "pmu,d2400"]:
