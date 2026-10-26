@@ -1930,6 +1930,119 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
     return 0;
 }
 
+static int dt_enable_iommus(const char *alias)
+{
+    u32 phandles[4];
+    int count = 0, len;
+
+    int node = fdt_path_offset(dt, alias);
+    if (node < 0)
+        return node;
+
+    const fdt32_t *iommus = fdt_getprop(dt, node, "iommus", &len);
+    if (!iommus || len < 4)
+        return 0;
+
+    int i = 0;
+    while (i < len / 4 && count < (int)ARRAY_SIZE(phandles)) {
+        u32 phandle = fdt32_ld(&iommus[i]);
+        int dart = fdt_node_offset_by_phandle(dt, phandle);
+        if (dart < 0)
+            bail("FDT: %s: iommu phandle %u not found\n", alias, phandle);
+
+        const fdt32_t *cells = fdt_getprop(dt, dart, "#iommu-cells", NULL);
+        phandles[count++] = phandle;
+        i += 1 + (cells ? fdt32_ld(cells) : 1);
+    }
+
+    for (i = 0; i < count; i++) {
+        int dart = fdt_node_offset_by_phandle(dt, phandles[i]);
+        if (dart < 0 || fdt_setprop_string(dt, dart, "status", "okay") < 0)
+            bail("FDT: %s: failed to enable iommu %u\n", alias, phandles[i]);
+    }
+
+    return 0;
+}
+
+/*
+ * The video encoder (AVE) runs a firmware iBoot preloads ("pre-loaded",
+ * "segment-ranges" __TEXT and __DATA). Reserve both segments at their DART
+ * addresses, keep a copy of __DATA as iBoot left it (macOS's AppleAVE2
+ * restores __DATA from such a copy before every start), and enable the node
+ * and its DARTs. A failure leaves the node disabled and the boot going.
+ */
+static const char ave_aliases[][8] = {"ave0", "ave1"};
+
+static int dt_set_ave(void)
+{
+    for (size_t n = 0; n < ARRAY_SIZE(ave_aliases); n++) {
+        const char *alias = ave_aliases[n];
+        char adt_path[32], node_name[64];
+        u32 preloaded = 0, len = 0;
+
+        if (fdt_path_offset(dt, alias) < 0)
+            continue;
+
+        snprintf(adt_path, sizeof(adt_path), "/arm-io/%s", alias);
+        int node = adt_path_offset(adt, adt_path);
+        if (node < 0) {
+            printf("ADT: %s not found\n", adt_path);
+            continue;
+        }
+
+        if (ADT_GETPROP(adt, node, "pre-loaded", &preloaded) < 0 || !preloaded) {
+            printf("ADT: %s: firmware not pre-loaded\n", adt_path);
+            continue;
+        }
+
+        const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &len);
+        if (!seg || len != 2 * sizeof(*seg) || !seg[1].phys || !seg[1].size) {
+            printf("ADT: %s: unexpected segment-ranges (%u bytes)\n", adt_path, len);
+            continue;
+        }
+
+        u64 data_phys = seg[1].phys;
+        size_t data_size = seg[1].size;
+
+        if (dt_reserve_asc_firmware(adt_path, NULL, alias, true, 0) < 0) {
+            printf("FDT: %s: reserving the firmware failed\n", alias);
+            continue;
+        }
+
+        size_t copy_size = ALIGN_UP(data_size, SZ_16K);
+        u64 copy = top_of_memory_alloc(copy_size);
+        memcpy((void *)copy, (void *)data_phys, data_size);
+        /* Linux restores __DATA uncached: leave no line of either behind */
+        dc_civac_range((void *)copy, copy_size);
+        dc_civac_range((void *)data_phys, data_size);
+
+        snprintf(node_name, sizeof(node_name), "%s-data@%lx", alias, copy);
+        int mem_node =
+            dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, copy, copy_size);
+        if (mem_node < 0 ||
+            dt_device_add_mem_region(alias, fdt_get_phandle(dt, mem_node), NULL) < 0) {
+            printf("FDT: %s: adding the __DATA copy failed\n", alias);
+            continue;
+        }
+
+        if (dt_enable_iommus(alias) < 0) {
+            printf("FDT: %s: enabling its DARTs failed\n", alias);
+            continue;
+        }
+
+        node = fdt_path_offset(dt, alias);
+        if (node < 0 || fdt_setprop_string(dt, node, "status", "okay") < 0) {
+            printf("FDT: failed to enable '%s'\n", alias);
+            continue;
+        }
+
+        printf("FDT: %s: firmware at 0x%lx/0x%lx, __DATA copy at 0x%lx\n", alias, seg[0].phys,
+               data_phys, copy);
+    }
+
+    return 0;
+}
+
 static const char dcpext_aliases[][8] = {
     "dcpext",  "dcpext0", "dcpext1", "dcpext2", "dcpext3",
     "dcpext4", "dcpext5", "dcpext6", "dcpext7",
@@ -2976,6 +3089,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_reserve_asc_firmware("/arm-io/isp", "/arm-io/isp0", "isp", false, isp_iova_base()))
         return -1;
     if (dt_set_isp_fwdata())
+        return -1;
+    if (dt_set_ave())
         return -1;
     if (dt_set_pmgr())
         return -1;
