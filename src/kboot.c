@@ -1387,6 +1387,73 @@ static int dt_set_pcie_tunables(void)
     return 0;
 }
 
+/*
+ * The ANS's tunables, which macOS applies each time the ANS powers on
+ * (AppleANS2NVMeController::ApplyTunables): the command accelerator's at offset
+ * 0x20000 of the NVMe registers, the others relative to their own windows.
+ */
+static const struct adt_tunable_info ans_tunables_t6031[] = {
+    {"command-accelerator-tunables", "apple,tunable-cmd-accel", 0x20000, 0x20000, false},
+    {"afc-aiu-ans-dual-tunables", "apple,tunable-afc-aiu", 0x0, 0x18000, false},
+    {"storage-lane-common-tunables", "apple,tunable-storage-lane", 0x0, 0xc000, false},
+    {"ccu-security-interrupt-tunables", "apple,tunable-ccu-security-irq", 0x0, 0x4000, false},
+};
+
+static int dt_append_ans_tunable(int adt_node, int fdt_node,
+                                 const struct adt_tunable_info *tunable_info)
+{
+    u32 len;
+    const struct acio_tunable *tunables = adt_getprop(adt, adt_node, tunable_info->adt_name, &len);
+
+    if (!tunables) {
+        printf("ADT: ANS tunable %s not found\n", tunable_info->adt_name);
+        return 0;
+    }
+    if (len % sizeof(*tunables)) {
+        printf("ADT: ANS tunable %s with invalid length %d\n", tunable_info->adt_name, len);
+        return -1;
+    }
+
+    for (u32 i = 0; i < len / sizeof(*tunables); i++) {
+        const struct acio_tunable *t = &tunables[i];
+
+        /* macOS skips the entries of size 0 */
+        if (!t->size)
+            continue;
+        if (t->size != 4 || t->offset % 4 || t->offset + 4 > tunable_info->reg_size) {
+            printf("ADT: ANS tunable %s has an invalid entry (offset 0x%x, size %d)\n",
+                   tunable_info->adt_name, t->offset, t->size);
+            return -1;
+        }
+
+        if (fdt_appendprop_u32(dt, fdt_node, tunable_info->fdt_name,
+                               t->offset + tunable_info->reg_offset) < 0 ||
+            fdt_appendprop_u32(dt, fdt_node, tunable_info->fdt_name, t->mask) < 0 ||
+            fdt_appendprop_u32(dt, fdt_node, tunable_info->fdt_name, t->value) < 0)
+            return -1;
+    }
+
+    return 0;
+}
+
+static int dt_set_ans_tunables(void)
+{
+    int adt_node = adt_path_offset(adt, "/arm-io/ans");
+    int fdt_node = fdt_node_offset_by_compatible(dt, -1, "apple,t6031-nvme-ans2");
+
+    if (adt_node < 0 || fdt_node < 0)
+        return 0;
+
+    for (size_t i = 0; i < ARRAY_SIZE(ans_tunables_t6031); i++) {
+        if (dt_append_ans_tunable(adt_node, fdt_node, &ans_tunables_t6031[i])) {
+            printf("FDT: ANS tunable %s not set\n", ans_tunables_t6031[i].fdt_name);
+            fdt_delprop(dt, fdt_node, ans_tunables_t6031[i].fdt_name);
+        }
+    }
+
+    return 0;
+}
+
 static int dt_get_iommu_node(int node, u32 num)
 {
     int len;
@@ -2881,6 +2948,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_acio_tunables())
         return -1;
     if (dt_set_pcie_tunables())
+        return -1;
+    if (dt_set_ans_tunables())
         return -1;
     if (dt_set_display())
         return -1;
