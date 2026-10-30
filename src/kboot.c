@@ -1968,8 +1968,11 @@ static int dt_enable_iommus(const char *alias)
  * The video encoder (AVE) runs a firmware iBoot preloads ("pre-loaded",
  * "segment-ranges" __TEXT and __DATA). Reserve both segments at their DART
  * addresses, keep a copy of __DATA as iBoot left it (macOS's AppleAVE2
- * restores __DATA from such a copy before every start), and enable the node
- * and its DARTs. A failure leaves the node disabled and the boot going.
+ * restores __DATA from such a copy before every start), and enable its DARTs.
+ * The node itself stays disabled until a driver for it ships: Linux keeps the
+ * power domains an enabled node names on for as long as no driver binds it
+ * (genpd's sync_state, the pmgr's GENPD_FLAG_DEFER_OFF). A failure leaves the
+ * boot going.
  */
 static const char ave_aliases[][8] = {"ave0", "ave1"};
 
@@ -2027,12 +2030,6 @@ static int dt_set_ave(void)
 
         if (dt_enable_iommus(alias) < 0) {
             printf("FDT: %s: enabling its DARTs failed\n", alias);
-            continue;
-        }
-
-        node = fdt_path_offset(dt, alias);
-        if (node < 0 || fdt_setprop_string(dt, node, "status", "okay") < 0) {
-            printf("FDT: failed to enable '%s'\n", alias);
             continue;
         }
 
