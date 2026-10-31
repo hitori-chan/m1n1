@@ -524,11 +524,11 @@ static void dt_set_gpu_g15_aux(void *dt, int sgx, const char *adt_prop, const ch
 
 /*
  * G15 (M3): the UAT regions, which iBoot places by the RAM size, and the
- * perf-state tables, whose volts iBoot bins per chip. The GPU's source table
- * goes in raw (apple,perf-states): the kernel builds macOS's two GPU tables
- * from it with the perf-state maps only the powered GPU gives. So does the
- * AON PTD table (apple,ptd-data-table). A failure leaves the DT's values and
- * never fails the boot.
+ * perf-state tables and the SRAM floor, whose volts iBoot bins per chip. The
+ * GPU's source table goes in raw (apple,perf-states): the kernel builds
+ * macOS's two GPU tables from it with the perf-state maps only the powered
+ * GPU gives. So does the AON PTD table (apple,ptd-data-table). A failure
+ * leaves the DT's values and never fails the boot.
  */
 static void dt_set_gpu_g15(void *dt)
 {
@@ -585,6 +585,19 @@ static void dt_set_gpu_g15(void *dt)
     }
     printf("FDT: GPU: %u perf states x %u tables\n", count, tables);
 
+    /* the SRAM floor, perf-states-sram's lowest mV (j514map: 815) */
+    const struct perf_state *sram = adt_getprop(adt, sgx, "perf-states-sram", &len);
+    if (sram && len == sizeof(*sram) * count * tables) {
+        u32 floor = sram[0].volt;
+        for (u32 i = 1; i < count * tables; i++)
+            floor = min(floor, sram[i].volt);
+        gpu = fdt_path_offset(dt, "gpu");
+        if (!floor || gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,min-sram-microvolt", floor * 1000))
+            printf("FDT: GPU: apple,min-sram-microvolt left as is\n");
+    } else {
+        printf("FDT: GPU: no perf-states-sram\n");
+    }
+
     /* the AON PTD rows, the kernel picks the GPU's */
     int ptd = adt_path_offset(adt, "/arm-io/aon-ptd");
     const void *rows = ptd < 0 ? NULL : adt_getprop(adt, ptd, "ptd_data_table", &len);
@@ -612,6 +625,7 @@ int dt_set_gpu(void *dt)
         case T6030:
         case T6031:
         case T6034:
+        case T8122:
             dt_set_gpu_g15(dt);
             return 0;
         case T8103:
