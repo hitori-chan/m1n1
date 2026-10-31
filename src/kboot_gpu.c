@@ -606,6 +606,30 @@ static void dt_set_gpu_g15(void *dt)
         fdt_setprop(dt, gpu, "apple,ptd-data-table", rows, len))
         printf("FDT: GPU: no apple,ptd-data-table\n");
 
+    /*
+     * The chip's leakage, from the fuses populateChipLeakageData reads:
+     * G15S one core value, G15G the core's and the SRAM's, G15C none (the
+     * DT's zeros stay). The counts are the DT's, one per cluster.
+     */
+    float core_leak[MAX_CLUSTERS] = {0}, sram_leak[MAX_CLUSTERS] = {0};
+    int nleak = 0;
+    switch (chip_id) {
+        case T6030:
+            load_fuses(core_leak, 1, 0x3642c81a8, 15, 15, 2, 2, false);
+            nleak = 2;
+            break;
+        case T8122:
+            load_fuses(core_leak, 1, 0x2e42c8128, 29, 14, 2, 2, false);
+            load_fuses(sram_leak, 1, 0x2e42c812c, 11, 10, 1, 1, false);
+            nleak = 1;
+            break;
+    }
+    gpu = fdt_path_offset(dt, "gpu");
+    if (nleak &&
+        (gpu < 0 || fdt_set_float_array(dt, gpu, "apple,core-leak-coef", core_leak, nleak) ||
+         fdt_set_float_array(dt, gpu, "apple,sram-leak-coef", sram_leak, nleak)))
+        printf("FDT: GPU: leakage left as is\n");
+
     dt_set_gpu_g15_aux(dt, sgx, "cs-perf-states", "apple,cs-opp");
     dt_set_gpu_g15_aux(dt, sgx, "afr-perf-states", "apple,afr-opp");
 }
