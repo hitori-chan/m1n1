@@ -490,6 +490,113 @@ static int fdt_set_aux_opp(void *dt, int gpu, const char *prop, const struct aux
     return 0;
 }
 
+static int fdt_count_opps(void *dt, int gpu, const char *prop)
+{
+    int len, opp, n = 0;
+    const fdt32_t *ph = fdt_getprop(dt, gpu, prop, &len);
+    if (!ph || len != 4)
+        return -1;
+
+    int opps = fdt_node_offset_by_phandle(dt, fdt32_ld(ph));
+    if (opps < 0)
+        return -1;
+
+    fdt_for_each_subnode(opp, dt, opps) n++;
+
+    return n;
+}
+
+static void dt_set_gpu_g15_aux(void *dt, int sgx, const char *adt_prop, const char *prop)
+{
+    u32 len;
+    const struct aux_perf_states *ps = adt_getprop(adt, sgx, adt_prop, &len);
+
+    int gpu = fdt_path_offset(dt, "gpu");
+    if (!ps || len < sizeof(*ps) || !ps->dies || ps->dies > MAX_DIES || ps->count > MAX_PSTATES ||
+        len < sizeof(*ps) + ps->dies * ps->count * sizeof(ps->states[0]) || gpu < 0 ||
+        fdt_count_opps(dt, gpu, prop) != (int)ps->count) {
+        printf("FDT: GPU: %s left as is\n", prop);
+        return;
+    }
+
+    fdt_set_aux_opp(dt, gpu, prop, ps, ps->dies);
+}
+
+/*
+ * G15 (M3): the UAT regions, which iBoot places by the RAM size, and the
+ * perf-state tables, whose volts iBoot bins per chip. The GPU's source table
+ * goes in raw (apple,perf-states): the kernel builds macOS's two GPU tables
+ * from it with the perf-state maps only the powered GPU gives. So does the
+ * AON PTD table (apple,ptd-data-table). A failure leaves the DT's values and
+ * never fails the boot.
+ */
+static void dt_set_gpu_g15(void *dt)
+{
+    static const struct {
+        const char *name;
+        const char *path;
+    } regions[] = {
+        {"gfx-handoff", "/reserved-memory/uat-handoff"},
+        {"gfx-shared-region", "/reserved-memory/uat-pagetables"},
+        {"gpu-region", "/reserved-memory/uat-ttbs"},
+        {"gfx-shared-l2-region", "/reserved-memory/uat-shared-l2"},
+    };
+    fdt32_t cells[2 * MAX_PSTATES * MAX_CLUSTERS];
+    u32 count, tables, len;
+
+    int sgx = adt_path_offset(adt, "/arm-io/sgx");
+    if (sgx < 0) {
+        printf("ADT: GPU: /arm-io/sgx node not found\n");
+        return;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(regions); i++)
+        if (dt_set_region(dt, sgx, regions[i].name, regions[i].path))
+            return;
+
+    if (ADT_GETPROP(adt, sgx, "perf-state-count", &count) < 0 ||
+        ADT_GETPROP(adt, sgx, "perf-state-table-count", &tables) < 0 || count < 2 ||
+        count > MAX_PSTATES || !tables || tables > MAX_CLUSTERS) {
+        printf("ADT: GPU: no perf-state counts\n");
+        return;
+    }
+
+    const struct perf_state *ps = adt_getprop(adt, sgx, "perf-states", &len);
+    if (!ps || len != sizeof(*ps) * count * tables) {
+        printf("ADT: GPU: invalid perf-states length\n");
+        return;
+    }
+
+    for (u32 i = 0; i < count * tables; i++) {
+        cells[2 * i] = cpu_to_fdt32(ps[i].freq);
+        cells[2 * i + 1] = cpu_to_fdt32(ps[i].volt);
+    }
+
+    int gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0 ||
+        fdt_setprop(dt, gpu, "apple,perf-states", cells, sizeof(u32) * 2 * count * tables)) {
+        printf("FDT: GPU: failed to set apple,perf-states\n");
+        return;
+    }
+    gpu = fdt_path_offset(dt, "gpu");
+    if (gpu < 0 || fdt_setprop_u32(dt, gpu, "apple,perf-state-table-count", tables)) {
+        printf("FDT: GPU: failed to set apple,perf-state-table-count\n");
+        return;
+    }
+    printf("FDT: GPU: %u perf states x %u tables\n", count, tables);
+
+    /* the AON PTD rows, the kernel picks the GPU's */
+    int ptd = adt_path_offset(adt, "/arm-io/aon-ptd");
+    const void *rows = ptd < 0 ? NULL : adt_getprop(adt, ptd, "ptd_data_table", &len);
+    gpu = fdt_path_offset(dt, "gpu");
+    if (!rows || !len || len % 12 || gpu < 0 ||
+        fdt_setprop(dt, gpu, "apple,ptd-data-table", rows, len))
+        printf("FDT: GPU: no apple,ptd-data-table\n");
+
+    dt_set_gpu_g15_aux(dt, sgx, "cs-perf-states", "apple,cs-opp");
+    dt_set_gpu_g15_aux(dt, sgx, "afr-perf-states", "apple,afr-opp");
+}
+
 int dt_set_gpu(void *dt)
 {
     bool has_cs_afr = false;
@@ -502,6 +609,11 @@ int dt_set_gpu(void *dt)
     printf("FDT: GPU: Initializing GPU info\n");
 
     switch (chip_id) {
+        case T6030:
+        case T6031:
+        case T6034:
+            dt_set_gpu_g15(dt);
+            return 0;
         case T8103:
             calc_power = calc_power_t8103;
             break;
