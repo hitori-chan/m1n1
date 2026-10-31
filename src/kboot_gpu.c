@@ -607,6 +607,39 @@ static void dt_set_gpu_g15(void *dt)
         printf("FDT: GPU: no apple,ptd-data-table\n");
 
     /*
+     * The GPU's MTR sensors: PMGR's mtr-polynom-fuse-agx, which iBoot adds
+     * and macOS's PMGR publishes as MtrPolynomGFX, words of a sensor, a byte
+     * length and the polynomial; the kernel takes one bit per sensor.
+     */
+    int pmgr = adt_path_offset(adt, "/arm-io/pmgr");
+    const u32 *mtr = pmgr < 0 ? NULL : adt_getprop(adt, pmgr, "mtr-polynom-fuse-agx", &len);
+    u64 mtr_mask[2] = {0, 0};
+    bool mtr_ok = mtr && len && !(len % 4);
+    u32 e = 0;
+    while (mtr_ok && e < len / 4) {
+        /* whole entries only, each ending inside the property */
+        if (e + 1 >= len / 4 || mtr[e] >= 128 || mtr[e + 1] % 4 ||
+            mtr[e + 1] / 4 > len / 4 - e - 2) {
+            mtr_ok = false;
+            break;
+        }
+        mtr_mask[mtr[e] / 64] |= BIT(mtr[e] % 64);
+        e += 2 + mtr[e + 1] / 4;
+    }
+    fdt32_t mtr_cells[4] = {
+        cpu_to_fdt32(mtr_mask[0]),
+        cpu_to_fdt32(mtr_mask[0] >> 32),
+        cpu_to_fdt32(mtr_mask[1]),
+        cpu_to_fdt32(mtr_mask[1] >> 32),
+    };
+    gpu = fdt_path_offset(dt, "gpu");
+    if (!mtr_ok || gpu < 0 ||
+        fdt_setprop(dt, gpu, "apple,mtr-sensor-mask", mtr_cells, sizeof(mtr_cells)))
+        printf("FDT: GPU: no apple,mtr-sensor-mask\n");
+    else
+        printf("FDT: GPU: MTR sensors 0x%lx 0x%lx\n", mtr_mask[0], mtr_mask[1]);
+
+    /*
      * The chip's leakage, from the fuses populateChipLeakageData reads:
      * G15S one core value, G15G the core's and the SRAM's, G15C none (the
      * DT's zeros stay). The counts are the DT's, one per cluster.
