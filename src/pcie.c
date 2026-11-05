@@ -830,6 +830,10 @@ static int pcie_init_controller(int controller, const char *path)
                 write32(state->port_base[port] + APCIE_T602X_PORT_MSIMAP + 4 * i, 0x80000000 | i);
         }
 
+        /* the bridge's dynamic enable, back on once the port is set up, before its link trains */
+        if (state->pcie_regs->type == APCIE_T6031)
+            set32(state->axi_base + 0x600, BIT(16));
+
         read32(state->port_base[port] + APCIE_PORT_LINKSTS);
 
         /* Move to the next PCIe device on this bus. */
