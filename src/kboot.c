@@ -126,6 +126,19 @@ static int dt_set_rng_seed_sep(int node)
     return 0;
 }
 
+/*
+ * With the sepOS booted by iBoot (/chosen/sepfw-load-at-boot), the ROM endpoint's random-bytes
+ * request is read and never answered, and the SEP reads nothing after it, the OS's shared-memory
+ * registration included (t6034): leave the SEP to the OS and take iBoot's seed.
+ */
+static bool sep_booted_by_iboot(void)
+{
+    int anode = adt_path_offset(adt, "/chosen");
+    u32 val;
+
+    return anode >= 0 && ADT_GETPROP(adt, anode, "sepfw-load-at-boot", &val) >= 0 && val;
+}
+
 static int dt_set_rng_seed_adt(int node)
 {
     int anode = adt_path_offset(adt, "/chosen");
@@ -313,7 +326,7 @@ static int dt_set_chosen(void)
     if (fdt_setprop(dt, node, "asahi,m1n1-stage2-version", m1n1_version, strlen(m1n1_version) + 1))
         bail("FDT: couldn't set asahi,m1n1-stage2-version\n");
 
-    if (dt_set_rng_seed_sep(node)) {
+    if (sep_booted_by_iboot() || dt_set_rng_seed_sep(node)) {
         if (dt_set_rng_seed_adt(node))
             bail("FDT: couldn't set random seed");
     }
