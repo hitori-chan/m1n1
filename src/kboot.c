@@ -2521,6 +2521,79 @@ static int dt_set_pmp(void)
     return 0;
 }
 
+static int hexval(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/*
+ * What macOS's SEP drivers read from the ADT and hand the sepOS, as the SEP node's properties for the OS's driver:
+ * - apple,os-uuid: /chosen/apfs-preboot-uuid's first 36 characters parsed as a UUID (AppleSEPXART
+ *   _determineOsUuidGated: uuid_parse; none when the property is missing or all zero), its 16 bytes;
+ * - apple,protected-data-access: /chosen/protected-data-access, 1 when nonzero or missing (get_chosen_property);
+ * - apple,cpx-encryption-mode: /defaults/cpx-encryption-mode, 0 when missing (AppleKeyStore::set_env).
+ */
+static int dt_set_sep_props(int node)
+{
+    int chosen = adt_path_offset(adt, "/chosen");
+    int defaults = adt_path_offset(adt, "/defaults");
+    const u8 *v;
+    u32 len, pda = 1, cpx = 0;
+
+    if (chosen < 0)
+        bail("ADT: /chosen not found\n");
+
+    v = adt_getprop(adt, chosen, "apfs-preboot-uuid", &len);
+    bool any = false;
+    for (u32 i = 0; v && i < len; i++)
+        any |= v[i] != 0;
+    if (v && any) {
+        u8 uuid[16];
+        int n = 0;
+
+        for (int i = 0; i < 36 && (u32)i < len; i++) {
+            if (i == 8 || i == 13 || i == 18 || i == 23) {
+                if (v[i] != '-')
+                    break;
+                continue;
+            }
+            int hi = hexval(v[i]), lo = (u32)i + 1 < len ? hexval(v[i + 1]) : -1;
+            if (hi < 0 || lo < 0)
+                break;
+            uuid[n++] = hi << 4 | lo;
+            i++;
+        }
+        if (n != 16)
+            bail("ADT: /chosen/apfs-preboot-uuid is not a UUID\n");
+        if (fdt_setprop(dt, node, "apple,os-uuid", uuid, sizeof(uuid)))
+            bail("FDT: couldn't set apple,os-uuid\n");
+    }
+
+    v = adt_getprop(adt, chosen, "protected-data-access", &len);
+    if (v && len == 4) {
+        memcpy(&pda, v, 4);
+        pda = !!pda;
+    }
+    if (fdt_setprop_u32(dt, node, "apple,protected-data-access", pda))
+        bail("FDT: couldn't set apple,protected-data-access\n");
+
+    v = defaults >= 0 ? adt_getprop(adt, defaults, "cpx-encryption-mode", &len) : NULL;
+    if (v && len == 4)
+        memcpy(&cpx, v, 4);
+    if (fdt_setprop_u32(dt, node, "apple,cpx-encryption-mode", cpx))
+        bail("FDT: couldn't set apple,cpx-encryption-mode\n");
+
+    printf("FDT: SEP: %s OS UUID, protected-data-access %u, cpx-encryption-mode %u\n", any ? "an" : "no", pda,
+           cpx);
+    return 0;
+}
+
 static int dt_set_sep(void)
 {
     const char *path = fdt_get_alias(dt, "sep");
@@ -2535,19 +2608,23 @@ static int dt_set_sep(void)
 
     u64 phys_map[2];
     size_t ret = ADT_GETPROP_ARRAY(adt, anode_mmap, "SEPFW", phys_map);
-    if (ret != sizeof(phys_map))
+    if (ret == sizeof(phys_map)) {
+        const char *node_name = "sep-firmware";
+        int mem_node =
+            dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", false, phys_map[0], phys_map[1]);
+        if (mem_node < 0)
+            bail("FDT: failed to reserve sepfw");
+
+        uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
+        ret = dt_device_add_mem_region(path, mem_phandle, "sepfw");
+        if (ret < 0)
+            bail("FDT: failed to add sepfw region");
+    } else if (sep_booted_by_iboot()) {
+        /* iBoot booted the sepOS: the OS only attaches, and there may be no SEPFW range to hand it */
+        printf("ADT: no sepfw memory; the sepOS is iBoot's\n");
+    } else {
         bail("ADT: could not get sepfw memory\n");
-
-    const char *node_name = "sep-firmware";
-    int mem_node =
-        dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", false, phys_map[0], phys_map[1]);
-    if (mem_node < 0)
-        bail("FDT: failed to reserve sepfw");
-
-    uint32_t mem_phandle = fdt_get_phandle(dt, mem_node);
-    ret = dt_device_add_mem_region(path, mem_phandle, "sepfw");
-    if (ret < 0)
-        bail("FDT: failed to add sepfw region");
+    }
 
     int node = fdt_path_offset(dt, path);
     if (node < 0)
@@ -2567,7 +2644,7 @@ static int dt_set_sep(void)
         bail("ADT: could not get iboot manifest\n");
     fdt_setprop(dt, node, "iboot-manifest", (void *)phys_map[0], phys_map[1]);
 
-    return 0;
+    return dt_set_sep_props(node);
 }
 
 static int dt_set_sio_fwdata(const char *adt_path, const char *fdt_alias)
@@ -3201,7 +3278,9 @@ int kboot_prepare_dt(void *fdt)
     dt_bufsize = fdt_totalsize(fdt);
     assert(dt_bufsize);
 
-    dt_bufsize += 6 * SZ_16K; // Add 96K of buffer for modifications
+    // Room for the modifications: 128K. The PMP's tunables (every property of its ADT node) and the SEP's
+    // boot manifests (about 9K on t6034) together outgrew 96K.
+    dt_bufsize += 8 * SZ_16K;
     dt = memalign(DT_ALIGN, dt_bufsize);
 
     if (fdt_open_into(fdt, dt, dt_bufsize) < 0)
