@@ -3254,6 +3254,11 @@ int kboot_prepare_dt(void *fdt)
     if (fdt_add_mem_rsv(dt, (u64)_base, ((u64)_end) - ((u64)_base)))
         bail("FDT: couldn't add reservation for m1n1\n");
 
+    size_t park_size;
+    u64 park = smp_park_reserved(&park_size);
+    if (park && fdt_add_mem_rsv(dt, park, park_size))
+        bail("FDT: couldn't add reservation for the cores still parked\n");
+
     if (!cpu_features->apple_sysregs_unlocked) {
         // On M4* / A18 Pro / M5*, there is a CTRR instance left enabled only
         // on the secondary (non-boot) cores. Add a reserved-memory region to

@@ -12,6 +12,7 @@
 #include "string.h"
 #include "types.h"
 #include "utils.h"
+#include "xnuboot.h"
 
 #define CPU_START_OFF_S5L8960X 0x30000
 #define CPU_START_OFF_S8000    0xd4000
@@ -154,6 +155,144 @@ void smp_secondary_prep_el3(void)
 #define CPU_STATUS_RUN GENMASK(15, 0)
 
 /*
+ * The park handover. A core restarts only from its first reset, so a reload over cores m1n1
+ * has started hands them over: the outgoing side (proxyclient's chainload.py) sends each one,
+ * with the MMU off as m1n1 runs its secondaries, to a WFE loop in a park page; the core fills
+ * its own slot, and the loop jumps to the slot's entry once that is set. The page is the last
+ * 16K of normal RAM, which neither image touches before smp_start_secondaries(), and this image
+ * maps it uncached, as the smp_shared data, so both sides see the parked cores' stores. The
+ * outgoing side writes the header and the loop only: each slot has a 128-byte line of its own.
+ * This is layout 1; smp_park_tag tells chainload.py that this image takes it. payload_run()
+ * needs no outgoing side: it chainloads before it starts any core.
+ */
+#define SMP_PARK_MAGIC   0x6b726170316e316dUL // "m1n1park", little-endian
+#define SMP_PARK_VERSION 1
+#define SMP_PARK_SIZE    SZ_16K
+#define SMP_PARK_SLOTS   0x2000
+#define SMP_PARK_PARKED  1
+
+// Written by the outgoing side
+struct smp_park_page {
+    u64 magic;
+    u64 version;
+    u64 self;
+    u64 count;
+    u64 nonce;
+};
+
+// Written by the parked core, but for the entry
+struct smp_park_slot {
+    u64 entry; // 0 until the incoming image sets it
+    u64 state; // SMP_PARK_PARKED, last; 2 as the core leaves
+    u64 mpidr;
+    u64 index; // the core's index in the outgoing image
+    u64 stamp; // CNTPCT_EL0 as the core parked
+    u64 nonce; // the page's, for this park
+    u64 pad[10];
+};
+
+static const char smp_park_tag[] = "##m1n1_park##1";
+static const char *const smp_park_version = smp_park_tag + 13;
+
+static struct smp_park_page *smp_park;
+static bool smp_park_looked;
+static u64 smp_park_kept;
+
+static struct smp_park_slot *smp_park_slot_at(struct smp_park_page *page, u64 i)
+{
+    return (void *)page + SMP_PARK_SLOTS + i * sizeof(struct smp_park_slot);
+}
+
+static struct smp_park_page *smp_park_find(void)
+{
+    u64 top = ALIGN_DOWN(cur_boot_args.phys_base + cur_boot_args.mem_size, SMP_PARK_SIZE);
+    struct smp_park_page *page = (void *)(top - SMP_PARK_SIZE);
+
+    if (mmu_active())
+        mmu_map_shared((u64)page, SMP_PARK_SIZE);
+
+    if (page->magic != SMP_PARK_MAGIC) {
+        printf("smp: no park at %p\n", page);
+        return NULL;
+    }
+
+    if (page->version != SMP_PARK_VERSION || page->self != (u64)page || page->count > MAX_CPUS) {
+        printf("smp: park at %p (layout %ld, at 0x%lx, %ld slots) ignored: this m1n1 takes "
+               "layout %s\n",
+               page, page->version, page->self, page->count, smp_park_version);
+        return NULL;
+    }
+
+    printf("smp: %ld cores parked at %p (layout %s)\n", page->count, page, smp_park_version);
+    return page;
+}
+
+static struct smp_park_slot *smp_park_slot(int index)
+{
+    if (!smp_park_looked) {
+        smp_park_looked = true;
+        smp_park = smp_park_find();
+    }
+
+    if (!smp_park)
+        return NULL;
+
+    u64 now = mrs(CNTPCT_EL0);
+    for (u64 i = 0; i < smp_park->count; i++) {
+        struct smp_park_slot *slot = smp_park_slot_at(smp_park, i);
+
+        if (slot->index == (u64)index && slot->state == SMP_PARK_PARKED &&
+            slot->nonce == smp_park->nonce && slot->stamp <= now)
+            return slot;
+    }
+
+    return NULL;
+}
+
+// Point the parked core at this image's reset vector, as if RVBAR had sent it there
+static void smp_park_release(struct smp_park_slot *slot)
+{
+    slot->entry = (u64)_vectors_start;
+    sysop("dsb sy");
+    sysop("sev");
+}
+
+// Retire the park once every core in it has left; keep it while any still waits there
+static void smp_park_finish(void)
+{
+    if (!smp_park_looked)
+        return;
+
+    smp_park_looked = false;
+    if (!smp_park)
+        return;
+
+    bool waiting = false;
+    for (u64 i = 0; i < smp_park->count; i++) {
+        struct smp_park_slot *slot = smp_park_slot_at(smp_park, i);
+
+        waiting |= slot->state == SMP_PARK_PARKED && slot->nonce == smp_park->nonce;
+    }
+
+    if (waiting) {
+        printf("smp: cores still wait in the park at %p: kept\n", smp_park);
+        smp_park_kept = (u64)smp_park;
+    } else {
+        smp_park->magic = 0;
+        sysop("dsb sy");
+        smp_park_kept = 0;
+    }
+
+    smp_park = NULL;
+}
+
+u64 smp_park_reserved(size_t *size)
+{
+    *size = SMP_PARK_SIZE;
+    return smp_park_kept;
+}
+
+/*
  * Whether some m1n1 has started a core in this boot: its RVBAR is unlocked, which only m1n1's
  * start does (iBoot leaves it locked). The CPU-start pulse releases a core only from its first
  * reset, so it does nothing on one that has run.
@@ -180,12 +319,15 @@ static void smp_start_cpu(int index, const struct cpu_info *cpu)
         return;
 
     // A core that has run reads a nonzero status: 0 for one never started, 0xd900 for one
-    // parked by m1n1, on the 14.8.3 stub
+    // parked by m1n1, on the 14.8.3 stub. One a reload parked is adopted whatever it reads.
+    struct smp_park_slot *slot = NULL;
     u64 status = 0;
-    if (smp_cpu_started(cpu))
+    if (smp_cpu_started(cpu)) {
         status = read64(cpu->impl_reg + CPU_STATUS) & CPU_STATUS_RUN;
+        slot = smp_park_slot(index);
+    }
 
-    if (status) {
+    if (status && !slot) {
         printf("CPU %d (%d:%d:%d) has run (status 0x%lx), not handed over: skipped\n", index,
                cpu->die, cpu->cluster, cpu->core, status);
         return;
@@ -197,7 +339,11 @@ static void smp_start_cpu(int index, const struct cpu_info *cpu)
                read64(cpu->impl_reg) & RVBAR_ADDR, (u64)_vectors_start);
     }
 
-    printf("Starting CPU %d (%d:%d:%d)... ", index, cpu->die, cpu->cluster, cpu->core);
+    if (slot)
+        printf("Adopting CPU %d (%d:%d:%d) from the park (status 0x%lx)... ", index, cpu->die,
+               cpu->cluster, cpu->core, status);
+    else
+        printf("Starting CPU %d (%d:%d:%d)... ", index, cpu->die, cpu->cluster, cpu->core);
 
     memset(&spin_table[index], 0, sizeof(struct spin_table));
 
@@ -215,26 +361,39 @@ static void smp_start_cpu(int index, const struct cpu_info *cpu)
         write64(cpu->impl_reg, (u64)_vectors_start);
     }
 
-    u64 start_base = cpu_start_base + cpu->die * PMGR_DIE_OFFSET;
+    if (slot) {
+        // Its first start did the CPU-start block's part
+        smp_park_release(slot);
+    } else {
+        u64 start_base = cpu_start_base + cpu->die * PMGR_DIE_OFFSET;
 
-    // Some kind of system level startup/status bit
-    // Without this, IRQs don't work
-    write32(start_base + 0x4, 1 << (4 * cpu->cluster + cpu->core));
+        // Some kind of system level startup/status bit
+        // Without this, IRQs don't work
+        write32(start_base + 0x4, 1 << (4 * cpu->cluster + cpu->core));
 
-    // Actually start the core
-    write32(start_base + 0x8 + 4 * cpu->cluster, 1 << cpu->core);
+        // Actually start the core
+        write32(start_base + 0x8 + 4 * cpu->cluster, 1 << cpu->core);
+    }
 
     for (i = 0; i < 100; i++) {
         sysop("dmb ld");
         if (spin_table[index].flag)
             break;
+        if (slot)
+            sysop("sev");
         udelay(1000);
     }
 
-    if (i >= 100)
+    if (i >= 100 && slot) {
+        // Keep it in the park, should an event release it later
+        slot->entry = 0;
+        sysop("dsb sy");
+        printf("Failed! (park state %ld)\n", slot->state);
+    } else if (i >= 100) {
         printf("Failed!\n");
-    else
+    } else {
         printf("  Started.\n");
+    }
 
     _reset_stack = dummy_stack + DUMMY_STACK_SIZE;
     _reset_stack_el1 = dummy_stack_el1 + DUMMY_STACK_SIZE;
@@ -519,6 +678,8 @@ void smp_start_secondaries(void)
 
         smp_start_cpu(i, cpu);
     }
+
+    smp_park_finish();
 }
 
 void smp_stop_secondaries(bool deep_sleep)
