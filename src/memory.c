@@ -459,12 +459,8 @@ void mmu_map_framebuffer(u64 addr, size_t size)
     mmu_add_mapping(addr, addr, size, MAIR_IDX_NORMAL_NC, PERM_RW_EL0);
 }
 
-static void mmu_remap_smp_shared(void)
+void mmu_map_shared(u64 base, size_t size)
 {
-    extern u8 _smp_shared_start[], _smp_shared_end[];
-    u64 base = (u64)_smp_shared_start;
-    u64 size = _smp_shared_end - _smp_shared_start;
-
     /*
      * Make sure there is absolutely no mapping anywhere that tries to access this area
      * through caches to prevent mismatched views of memory between cores that run with
@@ -474,6 +470,13 @@ static void mmu_remap_smp_shared(void)
     mmu_add_mapping(base | REGION_RWX_EL0, base, size, MAIR_IDX_DEVICE_nGnRnE, PERM_RW_EL0);
     mmu_add_mapping(base | REGION_RW_EL0, base, size, MAIR_IDX_DEVICE_nGnRnE, PERM_RW_EL0);
     mmu_add_mapping(base | REGION_RX_EL1, base, size, MAIR_IDX_DEVICE_nGnRnE, PERM_RW_EL0);
+}
+
+static void mmu_remap_smp_shared(void)
+{
+    extern u8 _smp_shared_start[], _smp_shared_end[];
+
+    mmu_map_shared((u64)_smp_shared_start, _smp_shared_end - _smp_shared_start);
 }
 
 static void mmu_add_default_mappings(void)
