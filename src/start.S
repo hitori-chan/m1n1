@@ -160,11 +160,13 @@ cpu_reset:
     // check if there's already an entry in the stack table for our MPIDR
     mrs x3, mpidr_el1
     and x3, x3, #0xffffff
+    mov x8, #0 // first look
+4:
     adrp x4, smp_reset_stacks
     add x4, x4, :lo12:smp_reset_stacks
     ldr x5, =MAX_CPUS
 1:
-    cbz x5, 2f // end if table, MPIDR not found -> use shared reset stack
+    cbz x5, 5f // end if table, MPIDR not found
     sub x5, x5, #1
 
     // x6 = MPIDR, x7 = stack
@@ -178,6 +180,19 @@ cpu_reset:
     cbz x7, 2f // entry has no stack -> use shared reset stack
     mov x1, x7 // entry has a valid stack -> use it
     b 3f
+
+5:
+    // MPIDR not found: a start in progress hands us the shared reset stack. Before the first
+    // start there is none, so wait without a stack until smp_init() gives us our own entry.
+    cbnz x8, 6f
+    adrp x1, _reset_stack
+    add x1, x1, :lo12:_reset_stack
+    ldr x1, [x1]
+    cbnz x1, 3f
+    mov x8, #1
+6:
+    wfe
+    b 4b
 
 2:
     adrp x1, _reset_stack
