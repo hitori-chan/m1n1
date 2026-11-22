@@ -978,14 +978,32 @@ static int dt_set_ipd(void)
 #define NVRAM_START    0x700000
 #define NVRAM_MAX_SIZE SZ_1M
 
+/*
+ * The template's nvram partition has no reg (<0 0>) until it is filled here, and the kernel's ofpart takes a
+ * partition whatever its status, a size of 0 being the rest of the flash: one left unfilled would be an "nvram" MTD
+ * over all of the NOR, iBoot's firmware included, for asahi-bless and asahi-nvram to write. So one that cannot be
+ * filled goes.
+ */
+static void dt_drop_nvram(void)
+{
+    int node = fdt_path_offset(dt, "nvram");
+
+    if (node >= 0 && fdt_nop_node(dt, node))
+        printf("FDT: couldn't remove the unfilled nvram partition\n");
+}
+
 static int dt_set_nvram(void)
 {
     int adt_path[8];
     u64 start, size;
 
+    /* the NOR's SPI controller is spi1 in macOS 14's ADT, qspi in 27's */
     int anode = adt_path_offset_trace(adt, "/arm-io/spi1/spinor/anvram", adt_path);
+    if (anode < 0)
+        anode = adt_path_offset_trace(adt, "/arm-io/qspi/spinor/anvram", adt_path);
     if (anode < 0) {
         printf("ADT: nvram partition not found\n");
+        dt_drop_nvram();
         return 0;
     }
 
@@ -997,12 +1015,14 @@ static int dt_set_nvram(void)
     int ret = adt_get_reg(adt, adt_path, "reg", 0, &start, &size);
     if (ret < 0) {
         printf("ADT: could not read nvram partition start/size\n");
+        dt_drop_nvram();
         return 0;
     }
 
-    if (start != NVRAM_START || size > NVRAM_MAX_SIZE) {
+    if (start != NVRAM_START || size > NVRAM_MAX_SIZE || !size) {
 
         printf("ADT: unexpected nvram partition start (0x%lx) size (0x%lx)\n", start, size);
+        dt_drop_nvram();
         return 0;
     }
 
@@ -1017,6 +1037,7 @@ static int dt_set_nvram(void)
     fdt32_st(reg + 1, size);
     if (fdt_setprop(dt, node, "reg", reg, sizeof(reg))) {
         printf("FDT: couldn't set nvram.reg\n");
+        dt_drop_nvram();
         return 0;
     }
 
