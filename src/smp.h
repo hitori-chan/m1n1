@@ -31,6 +31,7 @@ uint64_t smp_get_mpidr(int cpu);
 u64 smp_get_release_addr(int cpu);
 void smp_set_wfe_mode(bool new_mode);
 void smp_send_ipi(int cpu);
+u64 smp_park_reserved(size_t *size);
 
 static inline int smp_id(void)
 {
