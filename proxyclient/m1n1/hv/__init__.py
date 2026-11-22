@@ -1763,7 +1763,9 @@ class HV(Reloadable):
 
 
     def _prepare_load(self):
-        self.phys_base = guest_base = self.u.heap_top
+        # A first stage's heap can end off a page (Arch27's stage 2: ...2c0); a guest m1n1
+        # finds its base with adrp, so its image starts on a page.
+        self.phys_base = guest_base = align_up(self.u.heap_top)
         self.ram_base = self.phys_base & ~0xffffffff
         self.ram_size = self.u.ba.mem_size_actual
         guest_base += 32 << 20 # ensure guest starts 32MB above the start of mapped RAM to ensure that all mappings work
