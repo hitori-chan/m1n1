@@ -150,6 +150,22 @@ void smp_secondary_prep_el3(void)
     return;
 }
 
+#define CPU_STATUS     0x100
+#define CPU_STATUS_RUN GENMASK(15, 0)
+
+/*
+ * Whether some m1n1 has started a core in this boot: its RVBAR is unlocked, which only m1n1's
+ * start does (iBoot leaves it locked). The CPU-start pulse releases a core only from its first
+ * reset, so it does nothing on one that has run.
+ */
+static bool smp_cpu_started(const struct cpu_info *cpu)
+{
+    if (has_el3() || !cpu_features->apple_sysregs_unlocked)
+        return false;
+
+    return !(read64(cpu->impl_reg) & RVBAR_LOCK);
+}
+
 static void smp_start_cpu(int index, const struct cpu_info *cpu)
 {
     int i;
@@ -162,6 +178,18 @@ static void smp_start_cpu(int index, const struct cpu_info *cpu)
 
     if (spin_table[index].flag)
         return;
+
+    // A core that has run reads a nonzero status: 0 for one never started, 0xd900 for one
+    // parked by m1n1, on the 14.8.3 stub
+    u64 status = 0;
+    if (smp_cpu_started(cpu))
+        status = read64(cpu->impl_reg + CPU_STATUS) & CPU_STATUS_RUN;
+
+    if (status) {
+        printf("CPU %d (%d:%d:%d) has run (status 0x%lx), not handed over: skipped\n", index,
+               cpu->die, cpu->cluster, cpu->core, status);
+        return;
+    }
 
     if (!cpu_features->apple_sysregs_unlocked &&
         (read64(cpu->impl_reg) & RVBAR_ADDR) != (u64)_vectors_start) {
