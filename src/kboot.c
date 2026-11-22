@@ -2106,6 +2106,84 @@ static int dt_set_ave(void)
     return 0;
 }
 
+/*
+ * The AOP runs __TEXT and __DATA from its SRAM and maps __ETEXT and __EDATA at the addresses its boot args EC0p and
+ * ED0p give; macOS writes them from segment-ranges' remap (AppleSPUFirmwareService::
+ * configExternalSegmentsForPreloadedFirmware). Each segment outside the SRAM (but the log) is reserved at its remap in
+ * the AOP's DART, as the DCP's are, then both addresses are passed as apple,ec0p and apple,ed0p. Any failure leaves
+ * the AOP as the kernel's constant had it: nothing here stops the boot.
+ */
+static int dt_set_aop(void)
+{
+    int node = adt_path_offset(adt, "/arm-io/aop");
+    int nub = adt_path_offset(adt, "/arm-io/aop/iop-aop-nub");
+    u64 sram, sram_size, ec0p = 0, ed0p = 0;
+    bool have_ec0p = false, have_ed0p = false;
+    u32 len;
+
+    if (fdt_path_offset(dt, "aop") < 0)
+        return 0;
+    if (node < 0 || nub < 0 || ADT_GETPROP(adt, nub, "region-base", &sram) < 0 ||
+        ADT_GETPROP(adt, nub, "region-size", &sram_size) < 0) {
+        printf("ADT: aop: no node or SRAM region: EC0p left to the kernel\n");
+        return 0;
+    }
+    const struct adt_segment_ranges *seg = adt_getprop(adt, node, "segment-ranges", &len);
+    if (!seg || !len || len % sizeof(*seg)) {
+        printf("ADT: aop: no segment-ranges: EC0p left to the kernel\n");
+        return 0;
+    }
+
+    int fdt_node = fdt_path_offset(dt, "aop");
+    uint32_t phandle = fdt_get_phandle(dt, fdt_node);
+    if (!phandle && (fdt_generate_phandle(dt, &phandle) || fdt_setprop_u32(dt, fdt_node, "phandle", phandle))) {
+        printf("FDT: aop: no phandle: EC0p left to the kernel\n");
+        return 0;
+    }
+
+    for (u32 i = 0; i < len / sizeof(*seg); i++) {
+        char name[32];
+
+        if (adt_get_segment_name(adt, node, i, name, sizeof(name)) < 0)
+            continue;
+        printf("ADT: aop: %s phys 0x%lx remap 0x%lx size 0x%x\n", name, seg[i].phys, seg[i].remap, seg[i].size);
+        if (!strcmp(name, "__ETEXT")) {
+            ec0p = seg[i].remap;
+            have_ec0p = true;
+        } else if (!strcmp(name, "__EDATA")) {
+            ed0p = seg[i].remap;
+            have_ed0p = true;
+        }
+        if (!strcmp(name, "__OS_LOG") || !seg[i].size ||
+            (seg[i].phys >= sram && seg[i].phys < sram + sram_size))
+            continue;
+
+        char node_name[64];
+        size_t size = ALIGN_UP(seg[i].size, SZ_16K);
+        snprintf(node_name, sizeof(node_name), "asc-firmware@%lx", seg[i].phys);
+        int mem = dt_get_or_add_reserved_mem(node_name, "apple,asc-mem", true, seg[i].phys, size);
+        if (mem < 0 || dt_device_set_reserved_mem(mem, node_name, phandle, seg[i].remap, size) < 0) {
+            printf("FDT: aop: reserving %s failed: EC0p left to the kernel\n", name);
+            return 0;
+        }
+        mem = fdt_path_offset(dt, "/reserved-memory");
+        mem = mem < 0 ? mem : fdt_subnode_offset(dt, mem, node_name);
+        if (mem < 0 || dt_device_add_mem_region("aop", fdt_get_phandle(dt, mem), name + 2) < 0) {
+            printf("FDT: aop: %s's memory-region failed: EC0p left to the kernel\n", name);
+            return 0;
+        }
+    }
+
+    /* the node's offset moved with every reservation */
+    fdt_node = fdt_path_offset(dt, "aop");
+    if (fdt_node < 0 || (have_ec0p && fdt_setprop_u64(dt, fdt_node, "apple,ec0p", ec0p)))
+        printf("FDT: aop: apple,ec0p not set\n");
+    fdt_node = fdt_path_offset(dt, "aop");
+    if (fdt_node < 0 || (have_ed0p && fdt_setprop_u64(dt, fdt_node, "apple,ed0p", ed0p)))
+        printf("FDT: aop: apple,ed0p not set\n");
+    return 0;
+}
+
 static const char dcpext_aliases[][8] = {
     "dcpext",  "dcpext0", "dcpext1", "dcpext2", "dcpext3",
     "dcpext4", "dcpext5", "dcpext6", "dcpext7",
@@ -3346,6 +3424,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_isp_fwdata())
         return -1;
     if (dt_set_ave())
+        return -1;
+    if (dt_set_aop())
         return -1;
     if (dt_set_pmgr())
         return -1;
