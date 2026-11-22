@@ -3,7 +3,7 @@
 import sys, pathlib
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
-import argparse, pathlib, time
+import argparse, os, pathlib, struct, time
 
 parser = argparse.ArgumentParser(description='Mach-O loader for m1n1')
 parser.add_argument('-q', '--quiet', action="store_true", help="Disable framebuffer")
@@ -12,6 +12,7 @@ parser.add_argument('-c', '--call', action="store_true", help="Use call mode")
 parser.add_argument('-r', '--raw', action="store_true", help="Image is raw")
 parser.add_argument('-E', '--entry-point', action="store", type=int, help="Entry point for the raw image", default=0x800)
 parser.add_argument('-x', '--xnu', action="store_true", help="Set up for chainloading XNU")
+parser.add_argument('--no-park', action="store_true", help="Leave the started CPUs in this m1n1, which the new one overwrites")
 parser.add_argument('payload', type=pathlib.Path)
 parser.add_argument('boot_args', default=[], nargs="*")
 args = parser.parse_args()
@@ -145,6 +146,84 @@ p.dc_cvau(stub.addr, stub.len)
 p.ic_ivau(stub.addr, stub.len)
 
 print(f"Entry point: 0x{entry:x}")
+
+# The park handover (src/smp.c, layout 1). A core restarts only from its first reset, so the
+# CPUs this m1n1 started wait for the next one in a WFE loop in the last 16K of normal RAM. They
+# run with the MMU off (m1n1 never turns it on for a secondary unless asked: mmu_init_secondary,
+# the hypervisor), so the loop runs at its physical address, and each core writes its own slot
+# there, uncached; this side writes only the header and the loop, as its stores go through the
+# boot CPU's cache. The next m1n1 maps the page uncached, and its smp_start_secondaries() writes
+# a core's entry and sends an event.
+PARK_TAG = b"##m1n1_park##1"
+PARK_MAGIC = int.from_bytes(b"m1n1park", "little")
+PARK_SIZE, PARK_CODE, PARK_SLOTS, PARK_SLOT_SIZE = 0x4000, 0x1000, 0x2000, 0x80
+PARK_PARKED = 1
+PARK_MAX_CPUS = 32
+
+park_loop = """
+    // x0: this core's slot (entry, state, mpidr, index, stamp, nonce), x1: its index, x2: the nonce
+    msr daifset, #0xf
+    str xzr, [x0]
+    str x1, [x0, #0x18]
+    str x2, [x0, #0x28]
+    mrs x3, mpidr_el1
+    str x3, [x0, #0x10]
+    mrs x3, cntpct_el0
+    str x3, [x0, #0x20]
+    dsb sy
+    mov x3, #1
+    str x3, [x0, #0x8]
+    dsb sy
+1:
+    wfe
+    ldr x3, [x0]
+    cbz x3, 1b
+    mov x4, #2
+    str x4, [x0, #0x8]
+    dsb sy
+    ic iallu
+    dsb sy
+    isb
+    br x3
+"""
+
+def park_secondaries():
+    alive = [cpu for cpu in range(PARK_MAX_CPUS) if p.smp_is_alive(cpu)]
+    if not alive:
+        return
+    if args.xnu or args.no_park:
+        print(f"Leaving CPUs {alive} here: the next stage cannot start them again")
+        return
+    if PARK_TAG not in image:
+        print(f"The new m1n1 takes no parked CPUs: CPUs {alive} stay here and are lost")
+        return
+
+    page = align_down(u.ba.phys_base + u.ba.mem_size, PARK_SIZE) - PARK_SIZE
+    nonce = int.from_bytes(os.urandom(8), "little")
+    code = asm.ARMAsm(park_loop, page + PARK_CODE)
+    data = bytearray(PARK_CODE)
+    struct.pack_into("<5Q", data, 0, PARK_MAGIC, 1, page, len(alive), nonce)
+    data += code.data
+    iface.writemem(page, bytes(data))
+    p.dc_civac(page, len(data))
+    p.ic_ivau(page + PARK_CODE, len(code.data))
+
+    print(f"Parking CPUs {alive} at 0x{page:x}...")
+    for n, cpu in enumerate(alive):
+        slot = page + PARK_SLOTS + n * PARK_SLOT_SIZE
+        p.smp_call(cpu, page + PARK_CODE, slot, cpu, nonce)
+        # Read through the cache: a stale line only makes this report wrong; the next m1n1
+        # reads the slot uncached
+        for _ in range(50):
+            p.dc_civac(slot, PARK_SLOT_SIZE)
+            if p.read64(slot + 8) == PARK_PARKED and p.read64(slot + 0x28) == nonce:
+                print(f"  CPU {cpu}: MPIDR 0x{p.read64(slot + 0x10):x}")
+                break
+            time.sleep(0.01)
+        else:
+            print(f"  CPU {cpu}: not seen in the park (state {p.read64(slot + 8)}): the next m1n1 reports it")
+
+park_secondaries()
 
 if args.xnu and p.display_is_external():
     if p.display_start_dcp() >= 0:
