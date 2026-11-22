@@ -377,7 +377,9 @@ extern int boot_cpu_idx;
 extern u64 boot_cpu_mpidr;
 static inline int is_boot_cpu(void)
 {
-    return boot_cpu_idx == -1 || boot_cpu_mpidr == mrs(MPIDR_EL1);
+    // _start_c() records the boot CPU first, so a core entering at RVBAR before smp_init() is
+    // not taken for it
+    return boot_cpu_mpidr == mrs(MPIDR_EL1);
 }
 
 static inline size_t get_page_size(void)
