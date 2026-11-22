@@ -113,8 +113,12 @@ EOF
     fi
 fi
 
-echo "Chainloading to updated m1n1..."
-python3 "$base"/chainload.py -r "$base"/../../build/m1n1.bin
+# M1N1_NO_CHAINLOAD=1 runs the guest on the m1n1 already running, keeping the secondaries it
+# started (a core restarts only from its first reset).
+if [ -z "$M1N1_NO_CHAINLOAD" ]; then
+    echo "Chainloading to updated m1n1..."
+    python3 "$base"/chainload.py -r "$base"/../../build/m1n1.bin
+fi
 echo "Starting guest..."
 exec python3 "$base"/run_guest.py \
     -c "load_system_map('$kernel_base/System.map')" "$@" \
