@@ -6,6 +6,7 @@
 #include "aic_regs.h"
 #include "cpu_regs.h"
 #include "memory.h"
+#include "midr.h"
 #include "pmgr.h"
 #include "soc.h"
 #include "string.h"
@@ -258,6 +259,30 @@ static void smp_stop_cpu(int index, const struct cpu_info *cpu, bool deep_sleep)
     }
 }
 
+/*
+ * The MPIDR a CPU node stands for: Aff0-2 as its reg, and bit 16 for a P-core (j514m: E-core 0
+ * is 0x0, P0 core 0 0x10100, as the DTs have them). False for a core type it does not know.
+ */
+static bool smp_adt_mpidr(int node, u32 reg, u64 *mpidr)
+{
+    u32 len;
+    const char *type = adt_getprop(adt, node, "cluster-type", &len);
+
+    if (!type || len < 1)
+        return false;
+
+    *mpidr = reg & (CPU_REG_DIE | CPU_REG_CLUSTER | CPU_REG_CORE);
+    switch (type[0]) {
+        case 'E':
+            return true;
+        case 'P':
+            *mpidr |= MPIDR_CORE_TYPE_P;
+            return true;
+        default:
+            return false;
+    }
+}
+
 int smp_init(void)
 {
     if (smp_initialized)
@@ -419,7 +444,19 @@ int smp_init(void)
         cpu_info[i].cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
         cpu_info[i].die = FIELD_GET(CPU_REG_DIE, reg);
         cpu_info[i].impl_reg = cpu_impl_reg[0];
+
+        /*
+         * Each core's own reset stack up front, so a core entering at RVBAR outside a start
+         * (one an earlier image started) takes neither another's stack nor its spin table slot.
+         */
+        u64 mpidr;
+        if (i != boot_cpu_idx && !has_el3() && smp_adt_mpidr(cpu_node, reg, &mpidr)) {
+            smp_reset_stacks[i].stack = (u64)secondary_stacks[i] + SECONDARY_STACK_SIZE;
+            smp_reset_stacks[i].mpidr = mpidr;
+        }
     }
+    sysop("dsb sy");
+    sysop("sev");
 
     cpu_start_base = pmgr_reg + cpu_start_off;
     smp_initialized = true;
