@@ -2759,6 +2759,10 @@ static int dt_set_isp_fwdata(void)
         case V13_6_1:
             compat = &fw_versions[V13_5];
             break;
+        /* 27.2's ISP firmware takes 14.7's commands and boot arguments (t603x) */
+        case V27_2:
+            compat = &fw_versions[V14_7];
+            break;
         default:
             compat = &os_firmware;
             break;

@@ -155,6 +155,21 @@ int isp_init(void)
             }
             break;
         case ISP_VER_T603X:
+            /*
+             * heap_top is the kext's firmware buffer size for platforms
+             * 0x15C/0x15D (ISP_GetPlatformFirmwareBufferSize), 0x1000000 on
+             * 14.7/14.8.3 and 27.2; the heap is what __TEXT and __DATA leave.
+             */
+            switch (os_firmware.version) {
+                case V14_7:
+                case V27_2:
+                    heap_top = 0x1000000;
+                    break;
+                default:
+                    printf("isp: unsupported firmware\n");
+                    return -1;
+            }
+            break;
         case ISP_VER_T8122:
             switch (os_firmware.version) {
                 case V14_7:
