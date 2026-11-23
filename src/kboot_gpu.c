@@ -665,6 +665,19 @@ static void dt_set_gpu_g15(void *dt)
 
     dt_set_gpu_g15_aux(dt, sgx, "cs-perf-states", "apple,cs-opp");
     dt_set_gpu_g15_aux(dt, sgx, "afr-perf-states", "apple,afr-opp");
+
+    /*
+     * The GPU firmware's ABI follows the stub's macOS: the DT's default is the 14.x
+     * stubs' (14.7), and a 27.2 stub's firmware takes its own path in the driver.
+     */
+    if (os_firmware.version == V27_2) {
+        gpu = fdt_path_offset(dt, "gpu");
+        if (gpu < 0 || firmware_set_fdt(dt, gpu, "apple,firmware-version", &os_firmware) ||
+            firmware_set_fdt(dt, gpu, "apple,firmware-compat", &os_firmware))
+            printf("FDT: GPU: firmware version left as is\n");
+        else
+            printf("FDT: GPU: firmware %s\n", os_firmware.string);
+    }
 }
 
 int dt_set_gpu(void *dt)
