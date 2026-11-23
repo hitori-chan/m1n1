@@ -2489,9 +2489,12 @@ static int dt_set_pmp(void)
     int chosen_anode = adt_path_offset(adt, "/chosen");
     if (chosen_anode < 0)
         bail("ADT: /chosen not found \n");
+    // macOS 27's ADT numbers the PMP: /arm-io/pmp0/iop-pmp0-nub
     int pmp_iop_anode = adt_path_offset(adt, "/arm-io/pmp/iop-pmp-nub");
     if (pmp_iop_anode < 0)
-        bail("ADT: /arm-io/pmp/iop-pmp-nub not found \n");
+        pmp_iop_anode = adt_path_offset(adt, "/arm-io/pmp0/iop-pmp0-nub");
+    if (pmp_iop_anode < 0)
+        bail("ADT: the PMP's iop nub not found\n");
 
     u32 board_id, dram_vendor_id, dram_capacity = 0xFFFFFFFF;
     if (ADT_GETPROP(adt, chosen_anode, "board-id", &board_id) < 0)
